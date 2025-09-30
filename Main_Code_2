@@ -1,0 +1,102 @@
+# assign_classes.py
+# 200명 → 6개 반(34x2, 33x4) 배정 CP-SAT
+# 하드: 정원/한 학생=한 반/나쁜관계 분리/반당 리더십≥1
+# 소프트: 점수/성비/피아노/운동선호 균형, 비등교-도움친구, 전년도 재결합 최소화, 클럽 쏠림 완화
+# 실행:
+#   pip install ortools pandas
+#   python assign_classes.py --csv "학급반편성CSP 문제 입력파일.csv" --out "assignment_result.csv"
+
+import argparse, math
+from collections import defaultdict
+from itertools import combinations
+import pandas as pd
+from ortools.sat.python import cp_model
+
+def yn(x)->int: return 1 if str(x).strip().lower() in {"1","y","yes","true","t","예","네"} else 0
+def parse_rel(x):
+    if pd.isna(x): return []
+    s=str(x).strip()
+    if not s: return []
+    out=[]
+    for t in s.replace(",","|").split("|"):
+        t=t.strip()
+        if not t: continue
+        out.append(t.replace(".0",""))
+    return out
+
+def load(csv_path):
+    # 인코딩 문제 대비
+    try: df = pd.read_csv(csv_path)
+    except UnicodeDecodeError: df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    df["id"]=df["id"].astype(str)
+    df["sex"]=df["sex"].str.lower().map({"boy":1,"girl":0})
+    df["score"]=df["score"].astype(int)
+    for c in ["Leadership","Piano","비등교","운동선호"]:
+        df[c]=df[c].fillna("").apply(yn)
+    df["클럽"]=df["클럽"].fillna("").astype(str)
+    df["24년 학급"]=df["24년 학급"].astype(str)
+    df["좋은관계"]=df["좋은관계"].apply(parse_rel)
+    df["나쁜관계"]=df["나쁜관계"].apply(parse_rel)
+    return df
+
+def abs_dev(model, expr, target, ub, name):
+    diff = model.NewIntVar(-ub, ub, f"diff_{name}")
+    ad   = model.NewIntVar(0, ub, f"abs_{name}")
+    model.Add(diff == expr - target)
+    model.AddAbsEquality(ad, diff)
+    return ad
+
+def solve(df, class_labels=None, class_sizes=None, weights=None, time_limit=60.0, workers=8):
+    class_labels = class_labels or ["A","B","C","D","E","F"]
+    class_sizes  = class_sizes  or [34,34,33,33,33,33]
+    assert len(class_labels)==len(class_sizes)
+    C = len(class_labels); CL = list(range(C))
+
+    W = {"score":5,"gender":2,"piano":1,"sport":1,"truancy":6,"prev":1,"club":1}
+    if weights: W.update(weights)
+
+    S_ids = df["id"].tolist()
+    assert len(S_ids) == sum(class_sizes), "학생 수와 정원 합이 다릅니다."
+    sidset = set(S_ids)
+
+    score  = dict(zip(df["id"], df["score"]))
+    boy    = dict(zip(df["id"], df["sex"]))
+    lead   = dict(zip(df["id"], df["Leadership"]))
+    piano  = dict(zip(df["id"], df["Piano"]))
+    tru    = dict(zip(df["id"], df["비등교"]))
+    sport  = dict(zip(df["id"], df["운동선호"]))
+    club   = dict(zip(df["id"], df["클럽"]))
+    prevc  = dict(zip(df["id"], df["24년 학급"]))
+    goodR  = dict(zip(df["id"], df["좋은관계"]))
+    badR   = dict(zip(df["id"], df["나쁜관계"]))
+
+    # 나쁜관계 쌍(대칭/중복 제거)
+    dislikes=set()
+    for s in S_ids:
+        for t in badR[s]:
+            if t in sidset and t!=s:
+                a,b=sorted([s,t]); dislikes.add((a,b))
+
+    # 클럽 구성
+    club_members=defaultdict(list)
+    for s in S_ids:
+        if club[s]: club_members[club[s]].append(s)
+
+    total_score=sum(score.values())
+    tgt_score = round(total_score/C)
+    tgt_boys  = round(sum(boy.values())/C)
+    tgt_piano = round(sum(piano.values())/C)
+    tgt_sport = round(sum(sport.values())/C)
+
+    m = cp_model.CpModel()
+    x={(s,c): m.NewBoolVar(f"x_{s}_{c}") for s in S_ids for c in CL}
+
+    # 1) 한 학생=한 반
+    for s in S_ids: m.Add(sum(x[s,c] for c in CL)==1)
+    # 2) 정원
+    for c,cap in zip(CL, class_sizes): m.Add(sum(x[s,c] for s in S_ids)==cap)
+    # 3) 나쁜관계 분리
+    for a,b in dislikes:
+        for c in CL: m.Add(x[a,c]+x[b,c] <= 1)
+    # 4) 리더십 ≥1
+    for c in CL: m.Add(sum(lead[s]*x[s,c] for s in S_ids) >= 1)
